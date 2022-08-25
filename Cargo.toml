@@ -1,10 +1,17 @@
 [package]
-name = "z80sim"
+name = "gbs"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-log="0.4"
+log = "0.4"
 env_logger = "0.9.0"
+pretty_env_logger = { git = "https://github.com/seanmonstar/pretty-env-logger.git" }
+minifb = "0.23.0"
+clap = { version = "3", features = ["derive"] }
+blip_buf = "0.1.4"
+
+
+[features]

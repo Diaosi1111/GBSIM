@@ -1,8 +1,10 @@
-use std::thread;
+use std::{cell::RefCell, rc::Rc, thread};
 
 use log::debug;
+// use log::warn;
 
-use crate::mmu::MMU;
+use crate::bus::Bus;
+use crate::bus::Memory;
 use crate::term::Term;
 
 pub const CLOCK_FREQUENCY: u32 = 4_194_304;
@@ -66,16 +68,15 @@ const CB_CYCLES: [u32; 256] = [
 /// 2. Operation (0x40): 如果最后一个操作是减法;
 /// 3. Half-carry (0x20): 如果最后一个操作的低4位产生了一个溢出即大于15;
 /// 4. Carry (0x10): 如果最后一个操作产生了一个超过255（对于加法）或者小于0（对于减法）的结果.
-#[derive(Default)]
 pub struct Z80 {
     //Main rigesters
-    regs: Registers,
+    pub regs: Registers,
     halted: bool,
     ime: bool,
-    mmu: MMU,
+    bus: Rc<RefCell<Bus>>,
 }
 #[derive(Default)]
-struct Registers {
+pub struct Registers {
     a: u8,
     b: u8,
     c: u8,
@@ -85,7 +86,7 @@ struct Registers {
     h: u8,
     l: u8,
     sp: u16, //栈顶指针
-    pc: u16,
+    pub pc: u16,
 }
 
 /// 低4位保留
@@ -168,17 +169,19 @@ impl Registers {
 }
 
 impl Z80 {
-    pub fn new(term: Term) -> Self {
+    pub fn new(bus: Rc<RefCell<Bus>>) -> Self {
         let mut a = Z80 {
-            mmu: MMU::new(),
-            ..Default::default()
+            bus,
+            regs: Registers::default(),
+            halted: false,
+            ime: true,
         };
-        a.reset(term);
+        a.reset();
         a
     }
     /// 恢复执行完bios后的状态
-    pub fn reset(&mut self, term: Term) {
-        self.regs.reset(term);
+    pub fn reset(&mut self) {
+        self.regs.reset(self.bus.borrow().term);
         self.halted = false;
         self.ime = true;
     }
@@ -213,14 +216,14 @@ impl Z80 {
         //   Bit 2: Timer    Interrupt Request (INT 50h)  (1=Request)
         //   Bit 3: Serial   Interrupt Request (INT 58h)  (1=Request)
         //   Bit 4: Joypad   Interrupt Request (INT 60h)  (1=Request)
-        let intf = self.mmu.read_byte(0xff0f);
+        let intf = self.bus.borrow().read_byte(0xff0f);
         // FFFF - IE - Interrupt Enable (R/W)
         //   Bit 0: V-Blank  Interrupt Enable  (INT 40h)  (1=Enable)
         //   Bit 1: LCD STAT Interrupt Enable  (INT 48h)  (1=Enable)
         //   Bit 2: Timer    Interrupt Enable  (INT 50h)  (1=Enable)
         //   Bit 3: Serial   Interrupt Enable  (INT 58h)  (1=Enable)
         //   Bit 4: Joypad   Interrupt Enable  (INT 60h)  (1=Enable)
-        let inte = self.mmu.read_byte(0xffff);
+        let inte = self.bus.borrow().read_byte(0xffff);
         // 任何在IF中设为1的比特位代表 请求 一个中断
         // 只有IE中相应的比特位设为1同时IME标志为1时才会执行中断
         // 同时触发的终端会按照比特位由低(0-V-Blank)向高(4-Joypad)执行
@@ -239,7 +242,7 @@ impl Z80 {
         // 关闭将要执行的中断，其它的写回IF
         let n = ii.trailing_zeros();
         let intf = intf & !(1 << n);
-        self.mmu.write_byte(0xff0f, intf);
+        self.bus.borrow_mut().write_byte(0xff0f, intf);
 
         self.stack_push(self.regs.pc);
         // 开始执行中断
@@ -250,6 +253,7 @@ impl Z80 {
     /// 执行一条指令并返回用时
     pub fn step(&mut self) -> u32 {
         let op = self.imm();
+        // debug!("pc:0x{:4x}, opcode: 0x{:02x}", self.regs.pc - 1, op);
         let mut cb = 0u8;
         match op {
             // mnemonic, opcode bytes, clock cycles, affected flags (ordered as znhc), and explanatation.
@@ -317,82 +321,110 @@ impl Z80 {
             0x2e => self.regs.l = self.imm(),
             0x3e => self.regs.a = self.imm(),
             //  ld   r,(HL)      xx         8 ---- r=(HL)
-            0x46 => self.regs.b = self.mmu.read_byte(self.regs.get_hl()),
-            0x4e => self.regs.c = self.mmu.read_byte(self.regs.get_hl()),
-            0x56 => self.regs.d = self.mmu.read_byte(self.regs.get_hl()),
-            0x5e => self.regs.e = self.mmu.read_byte(self.regs.get_hl()),
-            0x66 => self.regs.h = self.mmu.read_byte(self.regs.get_hl()),
-            0x6e => self.regs.l = self.mmu.read_byte(self.regs.get_hl()),
-            0x7e => self.regs.a = self.mmu.read_byte(self.regs.get_hl()),
+            0x46 => self.regs.b = self.bus.borrow().read_byte(self.regs.get_hl()),
+            0x4e => self.regs.c = self.bus.borrow().read_byte(self.regs.get_hl()),
+            0x56 => self.regs.d = self.bus.borrow().read_byte(self.regs.get_hl()),
+            0x5e => self.regs.e = self.bus.borrow().read_byte(self.regs.get_hl()),
+            0x66 => self.regs.h = self.bus.borrow().read_byte(self.regs.get_hl()),
+            0x6e => self.regs.l = self.bus.borrow().read_byte(self.regs.get_hl()),
+            0x7e => self.regs.a = self.bus.borrow().read_byte(self.regs.get_hl()),
             //  ld   (HL),r      7x         8 ---- (HL)=r
-            0x70 => self.mmu.write_byte(self.regs.get_hl(), self.regs.b),
-            0x71 => self.mmu.write_byte(self.regs.get_hl(), self.regs.c),
-            0x72 => self.mmu.write_byte(self.regs.get_hl(), self.regs.d),
-            0x73 => self.mmu.write_byte(self.regs.get_hl(), self.regs.e),
-            0x74 => self.mmu.write_byte(self.regs.get_hl(), self.regs.h),
-            0x75 => self.mmu.write_byte(self.regs.get_hl(), self.regs.l),
-            0x77 => self.mmu.write_byte(self.regs.get_hl(), self.regs.a),
+            0x70 => self
+                .bus
+                .borrow_mut()
+                .write_byte(self.regs.get_hl(), self.regs.b),
+            0x71 => self
+                .bus
+                .borrow_mut()
+                .write_byte(self.regs.get_hl(), self.regs.c),
+            0x72 => self
+                .bus
+                .borrow_mut()
+                .write_byte(self.regs.get_hl(), self.regs.d),
+            0x73 => self
+                .bus
+                .borrow_mut()
+                .write_byte(self.regs.get_hl(), self.regs.e),
+            0x74 => self
+                .bus
+                .borrow_mut()
+                .write_byte(self.regs.get_hl(), self.regs.h),
+            0x75 => self
+                .bus
+                .borrow_mut()
+                .write_byte(self.regs.get_hl(), self.regs.l),
+            0x77 => self
+                .bus
+                .borrow_mut()
+                .write_byte(self.regs.get_hl(), self.regs.a),
             //  ld   (HL),n      36 nn     12 ----
             0x36 => {
                 let v = self.imm();
-                self.mmu.write_byte(self.regs.get_hl(), v);
+                self.bus.borrow_mut().write_byte(self.regs.get_hl(), v);
             }
             //  ld   A,(BC)      0A         8 ----
-            0x0a => self.regs.a = self.mmu.read_byte(self.regs.get_bc()),
+            0x0a => self.regs.a = self.bus.borrow().read_byte(self.regs.get_bc()),
             //  ld   A,(DE)      1A         8 ----
-            0x1a => self.regs.a = self.mmu.read_byte(self.regs.get_de()),
+            0x1a => self.regs.a = self.bus.borrow().read_byte(self.regs.get_de()),
             //  ld   A,(nn)      FA        16 ----
             0xfa => {
                 let a = self.imm_word();
-                self.regs.a = self.mmu.read_byte(a);
+                self.regs.a = self.bus.borrow().read_byte(a);
             }
             //  ld   (BC),A      02         8 ----
-            0x02 => self.mmu.write_byte(self.regs.get_bc(), self.regs.a),
+            0x02 => self
+                .bus
+                .borrow_mut()
+                .write_byte(self.regs.get_bc(), self.regs.a),
             //  ld   (DE),A      02         8 ----
-            0x12 => self.mmu.write_byte(self.regs.get_de(), self.regs.a),
+            0x12 => self
+                .bus
+                .borrow_mut()
+                .write_byte(self.regs.get_de(), self.regs.a),
             //  ld   (nn),A      EA        16 ----
             0xea => {
                 let a = self.imm_word();
-                self.mmu.write_byte(a, self.regs.a);
+                self.bus.borrow_mut().write_byte(a, self.regs.a);
             }
             //  ld   A,(FF00+n)  F0 nn     12 ---- read from io-port n (memory FF00+n)
             0xf0 => {
                 let a = 0xff00 | self.imm() as u16;
-                self.regs.a = self.mmu.read_byte(a);
+                self.regs.a = self.bus.borrow().read_byte(a);
             }
             //  ld   (FF00+n),A  E0 nn     12 ---- write to io-port n (memory FF00+n)
             0xe0 => {
                 let a = 0xff00 | self.imm() as u16;
-                self.mmu.write_byte(a, self.regs.a);
+                self.bus.borrow_mut().write_byte(a, self.regs.a);
             }
             //  ld   A,(FF00+C)  F2         8 ---- read from io-port C (memory FF00+C)
-            0xf2 => self.regs.a = self.mmu.read_byte(0xff00 | self.regs.c as u16),
+            0xf2 => self.regs.a = self.bus.borrow().read_byte(0xff00 | self.regs.c as u16),
             //  ld   (FF00+C),A  E2         8 ---- write to io-port C (memory FF00+C)
             0xe2 => self
-                .mmu
+                .bus
+                .borrow_mut()
                 .write_byte(0xff00 | self.regs.c as u16, self.regs.a),
             //  ldi  (HL),A      22         8 ---- (HL)=A, HL=HL+1
             0x22 => {
                 let v = self.regs.get_hl();
-                self.mmu.write_byte(v, self.regs.a);
+                self.bus.borrow_mut().write_byte(v, self.regs.a);
                 self.regs.set_hl(v + 1);
             }
             //  ldi  A,(HL)      2A         8 ---- A=(HL), HL=HL+1
             0x2a => {
                 let v = self.regs.get_hl();
-                self.regs.a = self.mmu.read_byte(v);
+                self.regs.a = self.bus.borrow().read_byte(v);
                 self.regs.set_hl(v + 1);
             }
             //  ldd  (HL),A      32         8 ---- (HL)=A, HL=HL-1
             0x32 => {
-                let v = self.regs.get_hl();
-                self.mmu.write_byte(v, self.regs.a);
-                self.regs.set_hl(v - 1);
+                let a = self.regs.get_hl();
+                self.bus.borrow_mut().write_byte(a, self.regs.a);
+                self.regs.set_hl(a - 1);
             }
             //  ldd  A,(HL)      3A         8 ---- A=(HL), HL=HL-1
             0x3a => {
                 let v = self.regs.get_hl();
-                self.regs.a = self.mmu.read_byte(v);
+                self.regs.a = self.bus.borrow().read_byte(v);
                 self.regs.set_hl(v - 1);
             }
 
@@ -411,7 +443,7 @@ impl Z80 {
             // LD (d16), SP
             0x08 => {
                 let a = self.imm_word();
-                self.mmu.write_word(a, self.regs.sp);
+                self.bus.borrow_mut().write_word(a, self.regs.sp);
             }
             //  ld   SP,HL       F9         8 ---- SP=HL
             0xf9 => self.regs.sp = self.regs.get_hl(),
@@ -447,7 +479,10 @@ impl Z80 {
                 self.alu_add(v);
             }
             //  add  A,(HL)      86         8 z0hc A=A+(HL)
-            0x86 => self.alu_add(self.mmu.read_byte(self.regs.get_hl())),
+            0x86 => {
+                let a = self.bus.borrow().read_byte(self.regs.get_hl());
+                self.alu_add(a);
+            }
             //  adc  A,r         8x         4 z0hc A=A+r+cy
             0x88 => self.alu_adc(self.regs.b),
             0x89 => self.alu_adc(self.regs.c),
@@ -462,7 +497,10 @@ impl Z80 {
                 self.alu_adc(v);
             }
             //  adc  A,(HL)      8E         8 z0hc A=A+(HL)+cy
-            0x8e => self.alu_adc(self.mmu.read_byte(self.regs.get_hl())),
+            0x8e => {
+                let a = self.bus.borrow().read_byte(self.regs.get_hl());
+                self.alu_adc(a);
+            }
             //  sub  r           9x         4 z1hc A=A-r
             0x90 => self.alu_sub(self.regs.b),
             0x91 => self.alu_sub(self.regs.c),
@@ -477,7 +515,10 @@ impl Z80 {
                 self.alu_sub(v);
             }
             //  sub  (HL)        96         8 z1hc A=A-(HL)
-            0x96 => self.alu_sub(self.mmu.read_byte(self.regs.get_hl())),
+            0x96 => {
+                let a = self.bus.borrow().read_byte(self.regs.get_hl());
+                self.alu_sub(a);
+            }
             //  sbc  A,r         9x         4 z1hc A=A-r-cy
             0x98 => self.alu_sbc(self.regs.b),
             0x99 => self.alu_sbc(self.regs.c),
@@ -492,7 +533,10 @@ impl Z80 {
                 self.alu_sbc(v);
             }
             //  sbc  A,(HL)      9E         8 z1hc A=A-(HL)-cy
-            0x9e => self.alu_sbc(self.mmu.read_byte(self.regs.get_hl())),
+            0x9e => {
+                let a = self.bus.borrow().read_byte(self.regs.get_hl());
+                self.alu_sbc(a);
+            }
             //  and  r           Ax         4 z010 A=A & r
             0xa0 => self.alu_and(self.regs.b),
             0xa1 => self.alu_and(self.regs.c),
@@ -507,7 +551,10 @@ impl Z80 {
                 self.alu_and(v);
             }
             //  and  (HL)        A6         8 z010 A=A & (HL)
-            0xa6 => self.alu_and(self.mmu.read_byte(self.regs.get_hl())),
+            0xa6 => {
+                let a = self.bus.borrow().read_byte(self.regs.get_hl());
+                self.alu_and(a);
+            }
             //  xor  r           Ax         4 z000
             0xa8 => self.alu_xor(self.regs.b),
             0xa9 => self.alu_xor(self.regs.c),
@@ -522,7 +569,10 @@ impl Z80 {
                 self.alu_xor(v);
             }
             //  xor  (HL)        AE         8 z000
-            0xae => self.alu_xor(self.mmu.read_byte(self.regs.get_hl())),
+            0xae => {
+                let a = self.bus.borrow().read_byte(self.regs.get_hl());
+                self.alu_xor(a);
+            }
             //  or   r           Bx         4 z000 A=A | r
             0xb0 => self.alu_or(self.regs.b),
             0xb1 => self.alu_or(self.regs.c),
@@ -537,7 +587,10 @@ impl Z80 {
                 self.alu_or(v);
             }
             //  or   (HL)        B6         8 z000 A=A | (HL)
-            0xb6 => self.alu_or(self.mmu.read_byte(self.regs.get_hl())),
+            0xb6 => {
+                let a = self.bus.borrow().read_byte(self.regs.get_hl());
+                self.alu_or(a);
+            }
             //  cp   r           Bx         4 z1hc compare A-r
             0xb8 => self.alu_cp(self.regs.b),
             0xb9 => self.alu_cp(self.regs.c),
@@ -552,7 +605,10 @@ impl Z80 {
                 self.alu_cp(v);
             }
             //  cp   (HL)        BE         8 z1hc compare A-(HL)
-            0xbe => self.alu_cp(self.mmu.read_byte(self.regs.get_hl())),
+            0xbe => {
+                let a = self.bus.borrow().read_byte(self.regs.get_hl());
+                self.alu_cp(a);
+            }
             //  inc  r           xx         4 z0h- r=r+1
             0x04 => self.regs.b = self.alu_inc(self.regs.b),
             0x0c => self.regs.c = self.alu_inc(self.regs.c),
@@ -564,9 +620,9 @@ impl Z80 {
             //  inc  (HL)        34        12 z0h- (HL)=(HL)+1
             0x34 => {
                 let a = self.regs.get_hl();
-                let v = self.mmu.read_byte(a);
+                let v = self.bus.borrow().read_byte(a);
                 let h = self.alu_inc(v);
-                self.mmu.write_byte(a, h);
+                self.bus.borrow_mut().write_byte(a, h);
             }
             //  dec  r           xx         4 z1h- r=r-1
             0x05 => self.regs.b = self.alu_dec(self.regs.b),
@@ -579,9 +635,9 @@ impl Z80 {
             //  dec  (HL)        35        12 z1h- (HL)=(HL)-1
             0x35 => {
                 let a = self.regs.get_hl();
-                let v = self.mmu.read_byte(a);
+                let v = self.bus.borrow().read_byte(a);
                 let h = self.alu_dec(v);
-                self.mmu.write_byte(a, h);
+                self.bus.borrow_mut().write_byte(a, h);
             }
             //  daa              27         4 z-0x decimal adjust akku
             0x27 => self.alu_daa(),
@@ -677,9 +733,9 @@ impl Z80 {
                     //  rlc  (HL)      CB 06       16 z00c rotate left
                     0x06 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_rlc(v);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     //  rl   r         CB 1x        8 z00c rotate left through carry
                     0x10 => self.regs.b = self.alu_rl(self.regs.b),
@@ -691,9 +747,9 @@ impl Z80 {
                     //  rl   (HL)      CB 16       16 z00c rotate left through carry
                     0x16 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_rl(v);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     //  rrc  r         CB 0x        8 z00c rotate right
                     0x08 => self.regs.b = self.alu_rrc(self.regs.b),
@@ -705,9 +761,9 @@ impl Z80 {
                     //  rrc  (HL)      CB 0E       16 z00c rotate right
                     0x0e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_rrc(v);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     //  rr   r         CB 1x        8 z00c rotate right through carry
                     0x18 => self.regs.b = self.alu_rr(self.regs.b),
@@ -719,9 +775,9 @@ impl Z80 {
                     //  rr   (HL)      CB 1E       16 z00c rotate right through carry
                     0x1e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_rr(v);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     //  sla  r         CB 2x        8 z00c shift left arithmetic (b0=0)
                     0x20 => self.regs.b = self.alu_sla(self.regs.b),
@@ -734,9 +790,9 @@ impl Z80 {
                     //  sla  (HL)      CB 26       16 z00c shift left arithmetic (b0=0)
                     0x26 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_sla(v);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     //  swap r         CB 3x        8 z000 exchange low/hi-nibble
                     0x30 => self.regs.b = self.alu_swap(self.regs.b),
@@ -749,9 +805,9 @@ impl Z80 {
                     //  swap (HL)      CB 36       16 z000 exchange low/hi-nibble
                     0x36 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_swap(v);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     //  sra  r         CB 2x        8 z00c shift right arithmetic (b7=b7)
                     0x28 => self.regs.b = self.alu_sra(self.regs.b),
@@ -764,9 +820,9 @@ impl Z80 {
                     //  sra  (HL)      CB 2E       16 z00c shift right arithmetic (b7=b7)
                     0x2e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_sra(v);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     //  srl  r         CB 3x        8 z00c shift right logical (b7=0)
                     0x38 => self.regs.b = self.alu_srl(self.regs.b),
@@ -779,9 +835,9 @@ impl Z80 {
                     //  srl  (HL)      CB 3E       16 z00c shift right logical (b7=0)
                     0x3e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_srl(v);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
 
                     //-----GMB Singlebit Operation Commands-----
@@ -801,7 +857,7 @@ impl Z80 {
                     0x45 => self.alu_bit(self.regs.l, 0),
                     0x46 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         self.alu_bit(v, 0);
                     }
                     0x47 => self.alu_bit(self.regs.a, 0),
@@ -813,7 +869,7 @@ impl Z80 {
                     0x4d => self.alu_bit(self.regs.l, 1),
                     0x4e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         self.alu_bit(v, 1);
                     }
                     0x4f => self.alu_bit(self.regs.a, 1),
@@ -825,7 +881,7 @@ impl Z80 {
                     0x55 => self.alu_bit(self.regs.l, 2),
                     0x56 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         self.alu_bit(v, 2);
                     }
                     0x57 => self.alu_bit(self.regs.a, 2),
@@ -837,7 +893,7 @@ impl Z80 {
                     0x5d => self.alu_bit(self.regs.l, 3),
                     0x5e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         self.alu_bit(v, 3);
                     }
                     0x5f => self.alu_bit(self.regs.a, 3),
@@ -849,7 +905,7 @@ impl Z80 {
                     0x65 => self.alu_bit(self.regs.l, 4),
                     0x66 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         self.alu_bit(v, 4);
                     }
                     0x67 => self.alu_bit(self.regs.a, 4),
@@ -861,7 +917,7 @@ impl Z80 {
                     0x6d => self.alu_bit(self.regs.l, 5),
                     0x6e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         self.alu_bit(v, 5);
                     }
                     0x6f => self.alu_bit(self.regs.a, 5),
@@ -873,7 +929,7 @@ impl Z80 {
                     0x75 => self.alu_bit(self.regs.l, 6),
                     0x76 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         self.alu_bit(v, 6);
                     }
                     0x77 => self.alu_bit(self.regs.a, 6),
@@ -885,7 +941,7 @@ impl Z80 {
                     0x7d => self.alu_bit(self.regs.l, 7),
                     0x7e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         self.alu_bit(v, 7);
                     }
                     0x7f => self.alu_bit(self.regs.a, 7),
@@ -899,9 +955,9 @@ impl Z80 {
                     0x85 => self.regs.l = self.alu_res(self.regs.l, 0),
                     0x86 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_res(v, 0);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0x87 => self.regs.a = self.alu_res(self.regs.a, 0),
                     0x88 => self.regs.b = self.alu_res(self.regs.b, 1),
@@ -912,9 +968,9 @@ impl Z80 {
                     0x8d => self.regs.l = self.alu_res(self.regs.l, 1),
                     0x8e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_res(v, 1);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0x8f => self.regs.a = self.alu_res(self.regs.a, 1),
                     0x90 => self.regs.b = self.alu_res(self.regs.b, 2),
@@ -925,9 +981,9 @@ impl Z80 {
                     0x95 => self.regs.l = self.alu_res(self.regs.l, 2),
                     0x96 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_res(v, 2);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0x97 => self.regs.a = self.alu_res(self.regs.a, 2),
                     0x98 => self.regs.b = self.alu_res(self.regs.b, 3),
@@ -938,9 +994,9 @@ impl Z80 {
                     0x9d => self.regs.l = self.alu_res(self.regs.l, 3),
                     0x9e => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_res(v, 3);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0x9f => self.regs.a = self.alu_res(self.regs.a, 3),
                     0xa0 => self.regs.b = self.alu_res(self.regs.b, 4),
@@ -951,9 +1007,9 @@ impl Z80 {
                     0xa5 => self.regs.l = self.alu_res(self.regs.l, 4),
                     0xa6 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_res(v, 4);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xa7 => self.regs.a = self.alu_res(self.regs.a, 4),
                     0xa8 => self.regs.b = self.alu_res(self.regs.b, 5),
@@ -964,9 +1020,9 @@ impl Z80 {
                     0xad => self.regs.l = self.alu_res(self.regs.l, 5),
                     0xae => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_res(v, 5);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xaf => self.regs.a = self.alu_res(self.regs.a, 5),
                     0xb0 => self.regs.b = self.alu_res(self.regs.b, 6),
@@ -977,9 +1033,9 @@ impl Z80 {
                     0xb5 => self.regs.l = self.alu_res(self.regs.l, 6),
                     0xb6 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_res(v, 6);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xb7 => self.regs.a = self.alu_res(self.regs.a, 6),
                     0xb8 => self.regs.b = self.alu_res(self.regs.b, 7),
@@ -990,9 +1046,9 @@ impl Z80 {
                     0xbd => self.regs.l = self.alu_res(self.regs.l, 7),
                     0xbe => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_res(v, 7);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xbf => self.regs.a = self.alu_res(self.regs.a, 7),
 
@@ -1005,9 +1061,9 @@ impl Z80 {
                     0xc5 => self.regs.l = self.alu_set(self.regs.l, 0),
                     0xc6 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_set(v, 0);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xc7 => self.regs.a = self.alu_set(self.regs.a, 0),
                     0xc8 => self.regs.b = self.alu_set(self.regs.b, 1),
@@ -1018,9 +1074,9 @@ impl Z80 {
                     0xcd => self.regs.l = self.alu_set(self.regs.l, 1),
                     0xce => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_set(v, 1);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xcf => self.regs.a = self.alu_set(self.regs.a, 1),
                     0xd0 => self.regs.b = self.alu_set(self.regs.b, 2),
@@ -1031,9 +1087,9 @@ impl Z80 {
                     0xd5 => self.regs.l = self.alu_set(self.regs.l, 2),
                     0xd6 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_set(v, 2);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xd7 => self.regs.a = self.alu_set(self.regs.a, 2),
                     0xd8 => self.regs.b = self.alu_set(self.regs.b, 3),
@@ -1044,9 +1100,9 @@ impl Z80 {
                     0xdd => self.regs.l = self.alu_set(self.regs.l, 3),
                     0xde => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_set(v, 3);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xdf => self.regs.a = self.alu_set(self.regs.a, 3),
                     0xe0 => self.regs.b = self.alu_set(self.regs.b, 4),
@@ -1057,9 +1113,9 @@ impl Z80 {
                     0xe5 => self.regs.l = self.alu_set(self.regs.l, 4),
                     0xe6 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_set(v, 4);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xe7 => self.regs.a = self.alu_set(self.regs.a, 4),
                     0xe8 => self.regs.b = self.alu_set(self.regs.b, 5),
@@ -1070,9 +1126,9 @@ impl Z80 {
                     0xed => self.regs.l = self.alu_set(self.regs.l, 5),
                     0xee => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_set(v, 5);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xef => self.regs.a = self.alu_set(self.regs.a, 5),
                     0xf0 => self.regs.b = self.alu_set(self.regs.b, 6),
@@ -1083,9 +1139,9 @@ impl Z80 {
                     0xf5 => self.regs.l = self.alu_set(self.regs.l, 6),
                     0xf6 => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_set(v, 6);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xf7 => self.regs.a = self.alu_set(self.regs.a, 6),
                     0xf8 => self.regs.b = self.alu_set(self.regs.b, 7),
@@ -1096,9 +1152,9 @@ impl Z80 {
                     0xfd => self.regs.l = self.alu_set(self.regs.l, 7),
                     0xfe => {
                         let a = self.regs.get_hl();
-                        let v = self.mmu.read_byte(a);
+                        let v = self.bus.borrow().read_byte(a);
                         let h = self.alu_set(v, 7);
-                        self.mmu.write_byte(a, h);
+                        self.bus.borrow_mut().write_byte(a, h);
                     }
                     0xff => self.regs.a = self.alu_set(self.regs.a, 7),
                 }
@@ -1110,23 +1166,27 @@ impl Z80 {
             0xe9 => self.regs.pc = self.regs.get_hl(),
             //  jp   f,nn      xx nn nn 16;12 ---- conditional jump if nz,z,nc,c
             0xc2 => {
+                let pc=self.imm_word();
                 if !self.regs.get_flag(Flag::Z) {
-                    self.regs.pc = self.imm_word();
+                    self.regs.pc = pc;
                 }
             }
             0xca => {
+                let pc=self.imm_word();
                 if self.regs.get_flag(Flag::Z) {
-                    self.regs.pc = self.imm_word();
+                    self.regs.pc = pc;
                 }
             }
             0xd2 => {
+                let pc=self.imm_word();
                 if !self.regs.get_flag(Flag::C) {
-                    self.regs.pc = self.imm_word();
+                    self.regs.pc = pc;
                 }
             }
             0xda => {
+                let pc=self.imm_word();
                 if self.regs.get_flag(Flag::C) {
-                    self.regs.pc = self.imm_word();
+                    self.regs.pc = pc;
                 }
             }
             //  jr   PC+dd     18 dd       12 ---- relative jump to nn (PC=PC+/-7bit)
@@ -1136,26 +1196,26 @@ impl Z80 {
             }
             //  jr   f,PC+dd   xx dd     12;8 ---- conditional relative jump if nz,z,nc,c
             0x20 => {
+                let a = self.imm();
                 if !self.regs.get_flag(Flag::Z) {
-                    let a = self.imm();
                     self.alu_jr(a);
                 }
             }
             0x28 => {
+                let a = self.imm();
                 if self.regs.get_flag(Flag::Z) {
-                    let a = self.imm();
                     self.alu_jr(a);
                 }
             }
             0x30 => {
+                let a = self.imm();
                 if !self.regs.get_flag(Flag::C) {
-                    let a = self.imm();
                     self.alu_jr(a);
                 }
             }
             0x38 => {
+                let a = self.imm();
                 if self.regs.get_flag(Flag::C) {
-                    let a = self.imm();
                     self.alu_jr(a);
                 }
             }
@@ -1167,29 +1227,29 @@ impl Z80 {
             }
             //  call f,nn      xx nn nn 24;12 ---- conditional call if nz,z,nc,c
             0xc4 => {
+                let a = self.imm_word();
                 if !self.regs.get_flag(Flag::Z) {
-                    let a = self.imm_word();
                     self.stack_push(self.regs.pc);
                     self.regs.pc = a;
                 }
             }
             0xcc => {
+                let a = self.imm_word();
                 if self.regs.get_flag(Flag::Z) {
-                    let a = self.imm_word();
                     self.stack_push(self.regs.pc);
                     self.regs.pc = a;
                 }
             }
             0xd4 => {
+                let a = self.imm_word();
                 if !self.regs.get_flag(Flag::C) {
-                    let a = self.imm_word();
                     self.stack_push(self.regs.pc);
                     self.regs.pc = a;
                 }
             }
             0xdc => {
+                let a = self.imm_word();
                 if self.regs.get_flag(Flag::C) {
-                    let a = self.imm_word();
                     self.stack_push(self.regs.pc);
                     self.regs.pc = a;
                 }
@@ -1364,24 +1424,24 @@ impl Z80 {
 
     /// 读取当前pc位置的一个字节，并将pc+1
     fn imm(&mut self) -> u8 {
-        let i = self.mmu.read_byte(self.regs.pc);
+        let i = self.bus.borrow().read_byte(self.regs.pc);
         self.regs.pc += 1;
         i
     }
     /// 读取当前pc位置的2个字节，并将pc+2
     fn imm_word(&mut self) -> u16 {
-        let i = self.mmu.read_word(self.regs.pc);
+        let i = self.bus.borrow().read_word(self.regs.pc);
         self.regs.pc += 2;
         i
     }
 
     fn stack_push(&mut self, v: u16) {
         self.regs.sp -= 2;
-        self.mmu.write_word(self.regs.sp, v);
+        self.bus.borrow_mut().write_word(self.regs.sp, v);
     }
 
     fn stack_pop(&mut self) -> u16 {
-        let i = self.mmu.read_word(self.regs.sp);
+        let i = self.bus.borrow().read_word(self.regs.sp);
         self.regs.sp += 2;
         i
     }
@@ -1693,16 +1753,16 @@ impl Z80 {
     }
 }
 // Real time cpu provided to simulate real hardware speed.
-pub struct Rtc {
+pub struct RTC {
     pub cpu: Z80,
     step_cycles: u32,
     step_zero: std::time::Instant,
     step_flip: bool,
 }
 
-impl Rtc {
-    pub fn power_up(term: Term) -> Self {
-        let cpu = Z80::new(term);
+impl RTC {
+    pub fn power_up(bus: Rc<RefCell<Bus>>) -> Self {
+        let cpu = Z80::new(bus);
         Self {
             cpu,
             step_cycles: 0,
